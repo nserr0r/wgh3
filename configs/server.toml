@@ -1,0 +1,14 @@
+mode = "server"
+token = "пароль"
+listen = "0.0.0.0:443"
+
+[wireguard]
+endpoint = "127.0.0.1:51820"
+
+[tls]
+cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+key = "/etc/letsencrypt/live/example.com/privkey.pem"
+
+[fallback]
+upstream = "127.0.0.1:3000"
+listen_tcp = "0.0.0.0:443"

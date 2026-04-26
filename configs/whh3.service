@@ -1,0 +1,51 @@
+[Unit]
+Description=wgh3 MASQUE WireGuard tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wgh3 /etc/webwg/config.toml
+Restart=on-failure
+RestartSec=5
+
+User=root
+Group=root
+Environment=RUST_LOG=wgh3=debug,quinn=warn,h3=warn
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+ReadOnlyPaths=/etc/wgh3 /etc/letsencrypt
+ReadWritePaths=
+
+RestrictAddressFamilies=AF_INET AF_INET6
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

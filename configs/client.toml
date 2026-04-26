@@ -1,0 +1,6 @@
+mode = "client"
+token = "пароль"
+listen = "127.0.0.1:51820"
+server = "1.2.3.4:443"
+server_name = "example.com"
+server_target = "127.0.0.1:51820"

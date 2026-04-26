@@ -1,0 +1,37 @@
+[package]
+name = "wgh3"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "*" }
+bytes = { version = "*" }
+futures-util = { version = "*" }
+h3 = { version = "*", features = [
+  "i-implement-a-third-party-backend-and-opt-into-breaking-changes"
+] }
+h3-datagram = { version = "*" }
+h3-masque = { version = "*" }
+h3-quinn = { version = "*", features = ["datagram"] }
+hex = { version = "*" }
+http = { version = "*" }
+http-body-util = "*"
+hyper = { version = "*", features = ["client", "http1", "server"] }
+hyper-util = { version = "*", features = ["tokio"] }
+quinn = { version = "*" }
+rustls = { version = "*", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = { version = "*" }
+serde = { version = "*", features = ["derive"] }
+sha2 = { version = "*" }
+tokio = { version = "*", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync"
+] }
+tokio-rustls = { version = "*" }
+toml = { version = "*" }
+tracing = { version = "*" }
+tracing-subscriber = { version = "*", features = ["env-filter"] }
+webpki-roots = { version = "*" }
