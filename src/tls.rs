@@ -37,15 +37,20 @@ pub fn server_config(cert_path: &str, key_path: &str) -> Result<ServerConfig> {
 pub fn client_config(pin_sha256: Option<&str>, insecure: bool) -> Result<ClientConfig> {
     let builder = rustls::ClientConfig::builder();
 
-    let mut tls = if let Some(pin) = pin_sha256 {
-        let fingerprint = parse_fingerprint(pin)?;
-        builder.dangerous().with_custom_certificate_verifier(Arc::new(PinnedVerifier { fingerprint })).with_no_client_auth()
-    } else if insecure {
-        builder.dangerous().with_custom_certificate_verifier(Arc::new(InsecureVerifier)).with_no_client_auth()
-    } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
+    let mut tls = match (pin_sha256, insecure) {
+        (Some(pin), _) => {
+            let verifier = CustomVerifier { mode: VerifyMode::Pinned(parse_fingerprint(pin)?) };
+            builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth()
+        }
+        (None, true) => {
+            let verifier = CustomVerifier { mode: VerifyMode::Insecure };
+            builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth()
+        }
+        (None, false) => {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
     };
 
     tls.alpn_protocols = vec![b"h3".to_vec()];
@@ -102,27 +107,18 @@ fn parse_fingerprint(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn supported_schemes() -> Vec<SignatureScheme> {
-    vec![
-        SignatureScheme::RSA_PKCS1_SHA256,
-        SignatureScheme::RSA_PKCS1_SHA384,
-        SignatureScheme::RSA_PKCS1_SHA512,
-        SignatureScheme::ECDSA_NISTP256_SHA256,
-        SignatureScheme::ECDSA_NISTP384_SHA384,
-        SignatureScheme::ECDSA_NISTP521_SHA512,
-        SignatureScheme::RSA_PSS_SHA256,
-        SignatureScheme::RSA_PSS_SHA384,
-        SignatureScheme::RSA_PSS_SHA512,
-        SignatureScheme::ED25519,
-    ]
+#[derive(Debug)]
+enum VerifyMode {
+    Pinned([u8; 32]),
+    Insecure,
 }
 
 #[derive(Debug)]
-struct PinnedVerifier {
-    fingerprint: [u8; 32],
+struct CustomVerifier {
+    mode: VerifyMode,
 }
 
-impl ServerCertVerifier for PinnedVerifier {
+impl ServerCertVerifier for CustomVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -131,12 +127,17 @@ impl ServerCertVerifier for PinnedVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        match &self.mode {
+            VerifyMode::Insecure => Ok(ServerCertVerified::assertion()),
+            VerifyMode::Pinned(fingerprint) => {
+                let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
 
-        if actual == self.fingerprint {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General("отпечаток сертификата не совпадает".into()))
+                if actual == *fingerprint {
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    Err(rustls::Error::General("отпечаток сертификата не совпадает".into()))
+                }
+            }
         }
     }
 
@@ -159,44 +160,17 @@ impl ServerCertVerifier for PinnedVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        supported_schemes()
-    }
-}
-
-#[derive(Debug)]
-struct InsecureVerifier;
-
-impl ServerCertVerifier for InsecureVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        supported_schemes()
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
     }
 }

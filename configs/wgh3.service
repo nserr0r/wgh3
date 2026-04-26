@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/wgh3 /etc/webwg/config.toml
+ExecStart=/usr/bin/wgh3 /etc/wgh3/config.toml
 Restart=on-failure
 RestartSec=5
 
