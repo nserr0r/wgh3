@@ -12,8 +12,12 @@ use http::StatusCode;
 use quinn::Endpoint;
 use std::future::poll_fn;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 pub async fn run(config: Config) -> Result<()> {
     let server = config.server.context("требуется адрес сервера")?;
@@ -23,10 +27,32 @@ pub async fn run(config: Config) -> Result<()> {
     eprintln!("[client] server={server} server_name={server_name} target={target}");
 
     let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse()? } else { "[::]:0".parse()? };
+    let local = UdpSocket::bind(config.listen).await?;
+    eprintln!("[client] локальный udp слушает {}", config.listen);
+
+    let mut backoff = RECONNECT_MIN;
+
+    loop {
+        match session(&config, server, &server_name, target, bind, &local).await {
+            Ok(()) => {
+                eprintln!("[client] сессия завершилась штатно");
+                backoff = RECONNECT_MIN;
+            }
+            Err(err) => {
+                eprintln!("[client] сессия упала: {err:#}");
+                eprintln!("[client] переподключение через {}с", backoff.as_secs());
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
+        }
+    }
+}
+
+async fn session(config: &Config, server: SocketAddr, server_name: &str, target: SocketAddr, bind: SocketAddr, local: &UdpSocket) -> Result<()> {
     let mut endpoint = Endpoint::client(bind)?;
     endpoint.set_default_client_config(tls::client_config(config.pin_sha256.as_deref(), config.insecure)?);
 
-    let quic = endpoint.connect(server, &server_name)?.await?;
+    let quic = endpoint.connect(server, server_name)?.await?;
     eprintln!("[client] quic установлен");
 
     let conn = H3QuinnConnection::new(quic);
@@ -37,7 +63,7 @@ pub async fn run(config: Config) -> Result<()> {
     let (stream_id_tx, mut stream_id_rx) = mpsc::channel(1);
     let (datagram_tx, mut datagram_rx) = mpsc::channel(1);
 
-    tokio::spawn(async move {
+    let driver_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = poll_fn(|cx| driver.poll_close(cx)) => {
@@ -82,40 +108,62 @@ pub async fn run(config: Config) -> Result<()> {
     stream_id_tx.send(stream.id()).await?;
     let mut datagram_sender = datagram_rx.recv().await.ok_or_else(|| anyhow!("отправитель датаграмм недоступен"))?;
 
-    let local = UdpSocket::bind(config.listen).await?;
-    eprintln!("[client] локальный udp слушает {}", config.listen);
-
     let mut peer: Option<SocketAddr> = None;
     let mut buf = vec![0u8; masque::MAX_PACKET_SIZE];
 
-    loop {
+    let result = loop {
         tokio::select! {
             received = local.recv_from(&mut buf) => {
-                let (size, addr) = received?;
+                let (size, addr) = match received {
+                    Ok(value) => value,
+                    Err(err) => break Err(err.into()),
+                };
+
                 if peer != Some(addr) {
                     eprintln!("[client] локальный пир: {addr}");
                 }
                 peer = Some(addr);
 
                 let data = masque::encode_datagram(&buf[..size]);
-                datagram_sender.send_datagram(data)?;
+                if let Err(err) = datagram_sender.send_datagram(data) {
+                    let msg = format!("{err:#}");
+                    if msg.contains("too large") {
+                        eprintln!("[client] пакет {size} байт не влез в datagram, дроп");
+                        continue;
+                    }
+                    break Err(err.into());
+                }
             }
 
             datagram = reader.read_datagram() => {
-                let datagram = datagram?;
-                let packet = masque::decode_datagram(datagram.into_payload())?;
+                let datagram = match datagram {
+                    Ok(value) => value,
+                    Err(err) => break Err(err.into()),
+                };
 
-                if let Some(addr) = peer {
-                    local.send_to(&packet, addr).await?;
+                let packet = match masque::decode_datagram(datagram.into_payload()) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+
+                if let Some(addr) = peer
+                    && let Err(err) = local.send_to(&packet, addr).await
+                {
+                    break Err(err.into());
                 }
             }
 
             data = stream.recv_data() => {
-                match data? {
-                    Some(_) => continue,
-                    None => return Err(anyhow!("сервер закрыл connect-udp поток")),
+                match data {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break Err(anyhow!("сервер закрыл connect-udp поток")),
+                    Err(err) => break Err(err.into()),
                 }
             }
         }
-    }
+    };
+
+    driver_task.abort();
+    endpoint.close(0u32.into(), b"reconnect");
+    result
 }

@@ -29,7 +29,6 @@ jobs:
           cp target/release/wgh3 dist/
           cp README.md LICENSE.txt dist/
           cp -r configs dist/ 2>/dev/null || true
-          cp -r configs dist/ 2>/dev/null || true
           cd dist && tar czf ../wgh3-linux-x86_64.tar.gz *
 
       - uses: actions/upload-artifact@v4

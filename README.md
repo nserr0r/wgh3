@@ -41,7 +41,7 @@ sudo make install
 
 ### Зависимости
 
-- Rust 1.85+
+- Rust 1.88+
 - Любой HTTP-сервер для маскировки на стороне сервера (опционально)
 - WireGuard
 - Let's Encrypt сертификат (рекомендуется) или self-signed с pinning
@@ -103,7 +103,7 @@ server {
 #### Пример с Caddy
 
 ```caddyfile
-:8080 {
+:3000 {
     bind 127.0.0.1
     root * /var/www/example.com
     file_server

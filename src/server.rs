@@ -205,6 +205,11 @@ where
                         let datagram = masque::encode_datagram(&buf[..size]);
 
                         if let Err(err) = sender.send_datagram(datagram) {
+                            let msg = format!("{err:#}");
+                            if msg.contains("too large") {
+                                eprintln!("[tunnel] пакет {size} байт не влез в datagram, дроп");
+                                continue;
+                            }
                             break Err(anyhow::anyhow!("ошибка отправки датаграммы: {err:#}"));
                         }
                     }
