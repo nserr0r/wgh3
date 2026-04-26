@@ -1,6 +1,6 @@
 [package]
 name = "wgh3"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 
 [dependencies]
@@ -19,7 +19,10 @@ http-body-util = "*"
 hyper = { version = "*", features = ["client", "http1", "server"] }
 hyper-util = { version = "*", features = ["tokio"] }
 quinn = { version = "*" }
-rustls = { version = "*", default-features = false, features = ["ring", "std"] }
+rustls = { version = "*", default-features = false, features = [
+  "aws-lc-rs",
+  "std"
+] }
 rustls-pemfile = { version = "*" }
 serde = { version = "*", features = ["derive"] }
 sha2 = { version = "*" }
@@ -35,3 +38,9 @@ toml = { version = "*" }
 tracing = { version = "*" }
 tracing-subscriber = { version = "*", features = ["env-filter"] }
 webpki-roots = { version = "*" }
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "thin"
+codegen-units = 1

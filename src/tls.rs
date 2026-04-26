@@ -75,8 +75,12 @@ fn transport_config() -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
-    transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    transport.datagram_send_buffer_size(4 * 1024 * 1024);
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.stream_receive_window((4u32 * 1024 * 1024).into());
+    transport.receive_window((16u32 * 1024 * 1024).into());
+    transport.send_window(16 * 1024 * 1024);
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     Ok(transport)
 }
 

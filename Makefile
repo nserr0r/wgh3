@@ -7,11 +7,11 @@ BINDIR ?= $(PREFIX)/bin
 DESTDIR ?=
 SYSCONFDIR ?= /etc
 UNITDIR ?= $(PREFIX)/lib/systemd/system
+SYSCTLDIR ?= $(PREFIX)/lib/sysctl.d
 
 BIN := target/release/$(NAME)
 SERVICE := configs/$(NAME).service
-CLIENT_CONFIG := configs/client.toml
-SERVER_CONFIG := configs/server.toml
+SYSCTL := configs/$(NAME)-sysctl.conf
 
 .PHONY: all build test check fmt fmt-check clippy clean install uninstall
 
@@ -38,16 +38,21 @@ clippy:
 clean:
 	$(CARGO) clean
 
+reload:
+	sudo sysctl --system
+	sudo systemctl daemon-reload
+	sudo systemctl restart $(NAME)
+
 install:
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(NAME)
 	install -d $(DESTDIR)$(SYSCONFDIR)/$(NAME)
 	install -d $(DESTDIR)$(UNITDIR)
 	install -m 0644 $(SERVICE) $(DESTDIR)$(UNITDIR)/$(NAME).service
-	install -m 0644 $(CLIENT_CONFIG) $(DESTDIR)$(SYSCONFDIR)/$(NAME)/client.toml
-	install -m 0644 $(SERVER_CONFIG) $(DESTDIR)$(SYSCONFDIR)/$(NAME)/server.toml
+	install -d $(DESTDIR)$(SYSCTLDIR)
+	install -m 0644 $(SYSCTL) $(DESTDIR)$(SYSCTLDIR)/60-$(NAME).conf
 
 uninstall:
-	rm -fr $(DESTDIR)$(BINDIR)/$(NAME)
-	rm -fr $(DESTDIR)$(SYSCONFDIR)/$(NAME)
-	rm -fr $(DESTDIR)$(UNITDIR)/$(NAME).service
+	rm -f $(DESTDIR)$(BINDIR)/$(NAME)
+	rm -f $(DESTDIR)$(UNITDIR)/$(NAME).service
+	rm -f $(DESTDIR)$(SYSCTLDIR)/60-$(NAME).conf

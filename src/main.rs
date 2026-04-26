@@ -9,7 +9,7 @@ use wgh3::server;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("wgh3=info"))).with_target(false).init();
 
-    rustls::crypto::ring::default_provider().install_default().map_err(|_| anyhow!("не удалось установить CryptoProvider"))?;
+    rustls::crypto::aws_lc_rs::default_provider().install_default().map_err(|_| anyhow!("не удалось установить CryptoProvider"))?;
 
     let path = std::env::args().nth(1).ok_or_else(|| anyhow!("использование: wgh3 <config.toml>"))?;
 

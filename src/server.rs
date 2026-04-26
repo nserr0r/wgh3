@@ -52,19 +52,17 @@ pub async fn run(config: Config) -> Result<()> {
 
     while let Some(incoming) = endpoint.accept().await {
         let config = config.clone();
-        let remote = incoming.remote_address();
 
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    eprintln!("[server] quic от {remote}");
                     let conn = H3QuinnConnection::new(conn);
 
                     if let Err(err) = serve_h3(conn, config).await {
                         eprintln!("[server] ошибка h3: {err:#}");
                     }
                 }
-                Err(err) => eprintln!("[server] ошибка accept от {remote}: {err:#}"),
+                Err(err) => eprintln!("[server] ошибка accept: {err:#}"),
             }
         });
     }
@@ -163,7 +161,7 @@ where
     let socket = Arc::new(UdpSocket::bind(bind).await?);
     socket.connect(target).await?;
 
-    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let (tx, mut rx) = mpsc::channel::<Bytes>(1024);
 
     let early = {
         let mut guard = sessions.lock().await;
@@ -181,56 +179,56 @@ where
     stream.send_response(response).await?;
 
     for packet in early {
-        socket.send(&packet).await?;
+        let _ = socket.send(&packet).await;
     }
 
-    let socket_send = socket.clone();
-
-    let send_task = tokio::spawn(async move {
-        while let Some(packet) = rx.recv().await {
-            if let Err(err) = socket_send.send(&packet).await {
-                eprintln!("[tunnel] ошибка отправки udp: {err:#}");
-                return;
+    let downlink = {
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            while let Some(packet) = rx.recv().await {
+                if socket.send(&packet).await.is_err() {
+                    return;
+                }
             }
-        }
-    });
+        })
+    };
 
-    let mut buf = vec![0u8; masque::MAX_PACKET_SIZE];
+    let uplink = {
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; masque::MAX_PACKET_SIZE];
+
+            loop {
+                let size = match socket.recv(&mut buf).await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+
+                let datagram = masque::encode_datagram(&buf[..size]);
+
+                if let Err(err) = sender.send_datagram(datagram) {
+                    if format!("{err:?}").contains("TooLarge") {
+                        continue;
+                    }
+                    return;
+                }
+            }
+        })
+    };
 
     let result = loop {
-        tokio::select! {
-            received = socket.recv(&mut buf) => {
-                match received {
-                    Ok(size) => {
-                        let datagram = masque::encode_datagram(&buf[..size]);
-
-                        if let Err(err) = sender.send_datagram(datagram) {
-                            let msg = format!("{err:#}");
-                            if msg.contains("too large") {
-                                eprintln!("[tunnel] пакет {size} байт не влез в datagram, дроп");
-                                continue;
-                            }
-                            break Err(anyhow::anyhow!("ошибка отправки датаграммы: {err:#}"));
-                        }
-                    }
-                    Err(err) => break Err(err.into()),
-                }
-            }
-
-            data = stream.recv_data() => {
-                match data {
-                    Ok(Some(_)) => continue,
-                    Ok(None) => break Ok(()),
-                    Err(err) => break Err(err.into()),
-                }
-            }
+        match stream.recv_data().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break Ok(()),
+            Err(err) => break Err(err.into()),
         }
     };
 
     eprintln!("[tunnel] завершение сессии {stream_id:?}");
 
     sessions.lock().await.remove(&stream_id);
-    send_task.abort();
+    uplink.abort();
+    downlink.abort();
     let _ = stream.finish().await;
 
     result
@@ -258,8 +256,7 @@ where
 
     let response = match fallback::proxy_request(fallback_config.upstream, request, body.freeze()).await {
         Ok(value) => value,
-        Err(err) => {
-            eprintln!("[server] ошибка fallback: {err:#}");
+        Err(_) => {
             reject(&mut stream, StatusCode::BAD_GATEWAY).await?;
             return Ok(());
         }
