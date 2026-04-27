@@ -1,6 +1,29 @@
 mode = "client"
-token = "пароль"
-listen = "127.0.0.1:51820"
+token = "password"
+
 server = "1.2.3.4:443"
 server_name = "example.com"
-server_target = "127.0.0.1:51820"
+
+[wireguard]
+private_key = "<client.key>"
+peer_public_key = "<server.pub>"
+peer_allowed_ips = ["0.0.0.0/0"]
+
+[network]
+tun_name = "wgh3"
+address = "10.0.0.2/24"
+mtu = 1380
+
+# Управление маршрутами (опционально).
+# Если не задано — wgh3 только поднимет TUN, маршруты настраивайте сами.
+#
+# auto_route = true       # сама ставит default через TUN + правила обхода для трафика к серверу
+# table = 51821           # routing-таблица (число | "main" | "off" | "auto")
+# fwmark = 51821          # метка пакетов wgh3 (по умолчанию 51821)
+# dns = ["1.1.1.1"]       # DNS-серверы для туннеля
+#
+# Хуки в стиле wg-quick. %i подставляется именем TUN.
+# pre_up = ["iptables -I OUTPUT -d 10.0.0.0/24 -j ACCEPT"]
+# post_up = ["echo туннель поднят"]
+# pre_down = ["echo туннель опускается"]
+# post_down = ["iptables -D OUTPUT -d 10.0.0.0/24 -j ACCEPT"]

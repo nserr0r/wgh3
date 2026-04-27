@@ -1,43 +1,47 @@
 [package]
 name = "wgh3"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 anyhow = { version = "*" }
+base64 = { version = "*" }
+blake2 = { version = "*" }
+boringtun = { version = "*" }
 bytes = { version = "*" }
-futures-util = { version = "*" }
 h3 = { version = "*", features = [
   "i-implement-a-third-party-backend-and-opt-into-breaking-changes"
 ] }
 h3-datagram = { version = "*" }
-h3-masque = { version = "*" }
 h3-quinn = { version = "*", features = ["datagram"] }
 hex = { version = "*" }
 http = { version = "*" }
 http-body-util = "*"
 hyper = { version = "*", features = ["client", "http1", "server"] }
 hyper-util = { version = "*", features = ["tokio"] }
+ipnet = { version = "*", features = ["serde"] }
+libc = { version = "*" }
 quinn = { version = "*" }
+rand_core = { version = "*", features = ["getrandom"] }
 rustls = { version = "*", default-features = false, features = [
   "aws-lc-rs",
   "std"
 ] }
 rustls-pemfile = { version = "*" }
 serde = { version = "*", features = ["derive"] }
+serde_json = { version = "*" }
 sha2 = { version = "*" }
-tokio = { version = "*", features = [
-  "io-util",
-  "macros",
-  "net",
-  "rt-multi-thread",
-  "sync"
-] }
+tokio = { version = "*", features = ["full", "macros", "rt-multi-thread"] }
 tokio-rustls = { version = "*" }
 toml = { version = "*" }
 tracing = { version = "*" }
 tracing-subscriber = { version = "*", features = ["env-filter"] }
+tun-rs = { version = "*", features = ["async"] }
 webpki-roots = { version = "*" }
+x25519-dalek = { version = "*", features = ["static_secrets"] }
+
+[dev-dependencies]
+rand_core = { version = "*", features = ["getrandom"] }
 
 [profile.release]
 opt-level = 3

@@ -3,5 +3,7 @@ pub mod config;
 pub mod decoy;
 pub mod fallback;
 pub mod masque;
+pub mod network;
 pub mod server;
 pub mod tls;
+pub mod wg;

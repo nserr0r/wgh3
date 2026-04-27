@@ -48,7 +48,7 @@ async fn handle(upstream: SocketAddr, request: hyper::Request<Incoming>) -> Resu
             Ok(hyper::Response::from_parts(parts, Full::new(body)))
         }
         Err(err) => {
-            eprintln!("ошибка decoy proxy: {err:#}");
+            tracing::warn!(?err, "ошибка decoy proxy");
             Ok(hyper::Response::builder().status(502).body(Full::new(Bytes::from_static(b"bad gateway"))).unwrap())
         }
     }

@@ -5,13 +5,13 @@ FLAGS := --release
 PREFIX ?= /usr
 BINDIR ?= $(PREFIX)/bin
 DESTDIR ?=
-SYSCONFDIR ?= /etc
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 SYSCTLDIR ?= $(PREFIX)/lib/sysctl.d
+SYSCONFDIR ?= /etc
 
 BIN := target/release/$(NAME)
-SERVICE := configs/$(NAME).service
 SYSCTL := configs/$(NAME)-sysctl.conf
+SERVICE := configs/$(NAME).service
 
 .PHONY: all build test check fmt fmt-check clippy clean install uninstall
 
@@ -45,11 +45,13 @@ reload:
 
 install:
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(NAME)
-	install -d $(DESTDIR)$(SYSCONFDIR)/$(NAME)
 	install -d $(DESTDIR)$(UNITDIR)
-	install -m 0644 $(SERVICE) $(DESTDIR)$(UNITDIR)/$(NAME).service
 	install -d $(DESTDIR)$(SYSCTLDIR)
+	install -d $(DESTDIR)$(SYSCONFDIR)/$(NAME)
+	install -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(NAME)
+	install -m 0600 configs/client.toml $(DESTDIR)$(SYSCONFDIR)/$(NAME)
+	install -m 0600 configs/server.toml $(DESTDIR)$(SYSCONFDIR)/$(NAME)
+	install -m 0644 $(SERVICE) $(DESTDIR)$(UNITDIR)/$(NAME).service
 	install -m 0644 $(SYSCTL) $(DESTDIR)$(SYSCTLDIR)/60-$(NAME).conf
 
 uninstall:
