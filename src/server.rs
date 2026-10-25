@@ -3,557 +3,410 @@ use crate::config::PeerConfig;
 use crate::decoy;
 use crate::fallback;
 use crate::masque;
+use crate::masque::DatagramChannel;
+use crate::mtu;
 use crate::network::lifecycle::Lifecycle;
+use crate::quic;
+use crate::session::Session;
+use crate::signal;
 use crate::tls;
 use crate::wg;
 use crate::wg::Tunnel;
-use crate::wg::TunnelAction;
 use anyhow::Context;
 use anyhow::Result;
-use bytes::Buf;
+use boringtun::noise::Packet;
+use boringtun::noise::Tunn;
+use boringtun::noise::handshake::parse_handshake_anon;
+use bytes::BufMut;
 use bytes::Bytes;
-use h3_datagram::datagram_handler::HandleDatagramsExt;
-use h3_quinn::Connection as H3QuinnConnection;
+use bytes::BytesMut;
+use http::Request;
 use http::Response;
 use http::StatusCode;
 use ipnet::IpNet;
-use quinn::Endpoint;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 use x25519_dalek::PublicKey;
 use x25519_dalek::StaticSecret;
 
-struct ServerPeer {
-    public_key: PublicKey,
-    preshared_key: Option<[u8; 32]>,
-    allowed_ips: Vec<IpNet>,
-    session: Mutex<Option<Arc<PeerSession>>>,
-}
+type RequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
-struct PeerSession {
-    tunnel: Arc<Tunnel>,
-    out_tx: mpsc::Sender<Bytes>,
-}
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 pub async fn run(config: Config) -> Result<()> {
-    let tls_config = config.tls.clone().context("требуется секция tls в конфиге")?;
-    let listen = config.listen.context("требуется listen в конфиге сервера")?;
-
-    let private_key = wg::parse_private_key(&config.wireguard.private_key)?;
-
     let peers = build_peers(&config.peers)?;
     tracing::info!(count = peers.len(), "загружено peers");
 
-    let extra_subnets: Vec<IpNet> = peers.iter().flat_map(|p| p.allowed_ips.clone()).collect();
+    let routed: Vec<IpNet> = config.peers.iter().flat_map(|peer| peer.allowed_ips.iter().copied()).collect();
+    let lifecycle = Lifecycle::setup(&config.network, &routed).await?;
 
-    let lifecycle = Lifecycle::setup(config.network.clone(), &extra_subnets).await?;
+    let result = serve(&config, peers, lifecycle.device.clone()).await;
 
-    let server_config = tls::server_config(&tls_config.cert, &tls_config.key)?;
-    let endpoint = Endpoint::server(server_config, listen)?;
-    tracing::info!(%listen, "quic слушает");
-
-    if let Some(fallback) = config.fallback.clone()
-        && let Some(listen_tcp) = fallback.listen_tcp
-    {
-        let rustls_config = tls::rustls_server_config(&tls_config.cert, &tls_config.key)?;
-        tracing::info!(%listen_tcp, upstream = %fallback.upstream, "decoy слушает");
-
-        tokio::spawn(async move {
-            if let Err(err) = decoy::run(listen_tcp, fallback.upstream, rustls_config).await {
-                tracing::error!(?err, "decoy остановлен");
-            }
-        });
-    }
-
-    let peers = Arc::new(peers);
-    spawn_tun_dispatcher(lifecycle.tun.handle(), peers.clone());
-
-    let result = tokio::select! {
-        result = accept_loop(&endpoint, &config, peers, &private_key, lifecycle.tun.handle()) => result,
-        _ = wait_shutdown() => {
-            tracing::info!("получен сигнал завершения");
-            Ok(())
-        }
-    };
-
-    endpoint.close(0u32.into(), b"shutdown");
     lifecycle.teardown().await;
     result
 }
 
-async fn accept_loop(
-    endpoint: &Endpoint,
-    config: &Config,
-    peers: Arc<Vec<Arc<ServerPeer>>>,
-    private_key: &StaticSecret,
-    device: Arc<AsyncDevice>,
-) -> Result<()> {
-    while let Some(incoming) = endpoint.accept().await {
-        let config = config.clone();
-        let peers = peers.clone();
-        let private_key = private_key.clone();
-        let device = device.clone();
+async fn serve(config: &Config, peers: Vec<Arc<Peer>>, device: Arc<AsyncDevice>) -> Result<()> {
+    let tls = config.tls.as_ref().context("требуется секция [tls]")?;
+    let listen = config.listen.context("требуется listen")?;
+    let private_key = wg::parse_private_key(&config.wireguard.private_key)?;
 
-        tokio::spawn(async move {
-            match incoming.await {
-                Ok(conn) => {
-                    let conn = H3QuinnConnection::new(conn);
+    let endpoint = quic::server_endpoint(listen, tls::server_config(&tls.cert, &tls.key, tls::ALPN_H3)?, config.network.mtu)?;
+    tracing::info!(%listen, "quic слушает");
 
-                    if let Err(err) = serve_h3(conn, config, peers, private_key, device).await {
-                        tracing::warn!(?err, "ошибка h3");
-                    }
-                }
-                Err(err) => tracing::warn!(?err, "ошибка accept"),
+    let decoy = async {
+        match config.fallback.as_ref().and_then(|fallback| Some((fallback.listen_tcp?, fallback.upstream))) {
+            Some((listen_tcp, upstream)) => {
+                let tls = tls::server_config(&tls.cert, &tls.key, tls::ALPN_HTTPS)?;
+                tracing::info!(%listen_tcp, %upstream, "decoy слушает");
+                decoy::run(listen_tcp, upstream, Arc::new(tls)).await
             }
-        });
-    }
-
-    Ok(())
-}
-
-async fn wait_shutdown() {
-    use tokio::signal::unix::SignalKind;
-    use tokio::signal::unix::signal;
-
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
+            None => std::future::pending().await,
+        }
     };
 
-    tokio::select! {
-        _ = term.recv() => {},
-        _ = int.recv() => {},
-    }
+    let server = Arc::new(Server {
+        token: config.token.clone(),
+        upstream: config.fallback.as_ref().map(|fallback| fallback.upstream),
+        public_key: PublicKey::from(&private_key),
+        private_key,
+        keepalive: config.wireguard.persistent_keepalive,
+        mtu: config.network.mtu,
+        peers,
+        device,
+    });
+
+    let result = tokio::select! {
+        result = server.accept(&endpoint) => result,
+        result = server.dispatch_device() => result,
+        result = decoy => result.context("decoy остановлен"),
+        result = signal::shutdown() => result,
+    };
+
+    endpoint.close(0u32.into(), b"shutdown");
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, endpoint.wait_idle()).await;
+    result
 }
 
-fn build_peers(configs: &[PeerConfig]) -> Result<Vec<Arc<ServerPeer>>> {
+fn build_peers(configs: &[PeerConfig]) -> Result<Vec<Arc<Peer>>> {
     let mut peers = Vec::with_capacity(configs.len());
 
-    for cfg in configs {
-        let public_key = wg::parse_public_key(&cfg.public_key)?;
-        let preshared_key = cfg.preshared_key.as_deref().map(wg::parse_preshared_key).transpose()?;
-
-        peers.push(Arc::new(ServerPeer { public_key, preshared_key, allowed_ips: cfg.allowed_ips.clone(), session: Mutex::new(None) }));
+    for config in configs {
+        peers.push(Arc::new(Peer {
+            public_key: wg::parse_public_key(&config.public_key)?,
+            preshared_key: config.preshared_key.as_deref().map(wg::parse_preshared_key).transpose()?,
+            allowed_ips: config.allowed_ips.clone(),
+            session: Mutex::new(None),
+        }));
     }
 
     Ok(peers)
 }
 
-fn spawn_tun_dispatcher(device: Arc<AsyncDevice>, peers: Arc<Vec<Arc<ServerPeer>>>) {
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; crate::network::tun::MAX_PACKET_SIZE];
+struct Peer {
+    public_key: PublicKey,
+    preshared_key: Option<[u8; 32]>,
+    allowed_ips: Vec<IpNet>,
+    session: Mutex<Option<Arc<Session>>>,
+}
 
-        loop {
-            let size = match device.recv(&mut buf).await {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::error!(?err, "tun recv");
-                    return;
+impl Peer {
+    fn name(&self) -> String {
+        wg::encode_b64(self.public_key.as_bytes()).chars().take(8).collect()
+    }
+
+    fn session(&self) -> Option<Arc<Session>> {
+        self.lock().clone()
+    }
+
+    fn attach(&self, session: Arc<Session>) -> bool {
+        self.lock().replace(session).is_some()
+    }
+
+    fn detach(&self, session: &Arc<Session>) {
+        let mut current = self.lock();
+        if current.as_ref().is_some_and(|active| Arc::ptr_eq(active, session)) {
+            *current = None;
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<Session>>> {
+        self.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct Server {
+    token: String,
+    upstream: Option<SocketAddr>,
+    private_key: StaticSecret,
+    public_key: PublicKey,
+    keepalive: u16,
+    mtu: u16,
+    peers: Vec<Arc<Peer>>,
+    device: Arc<AsyncDevice>,
+}
+
+impl Server {
+    async fn accept(self: &Arc<Self>, endpoint: &quinn::Endpoint) -> Result<()> {
+        while let Some(incoming) = endpoint.accept().await {
+            let server = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = server.serve_connection(incoming).await {
+                    tracing::debug!(error = format!("{err:#}"), "соединение закрыто");
                 }
-            };
+            });
+        }
 
-            let packet = &buf[..size];
-            let dst = match destination_ip(packet) {
-                Some(value) => value,
-                None => continue,
-            };
+        Ok(())
+    }
 
-            let peer = match find_peer_by_ip(&peers, dst) {
-                Some(value) => value,
-                None => continue,
-            };
+    async fn serve_connection(self: Arc<Self>, incoming: quinn::Incoming) -> Result<()> {
+        let connection = incoming.await?;
+        let mut h3 = h3::server::builder().enable_datagram(true).enable_extended_connect(true).build(h3_quinn::Connection::new(connection.clone())).await?;
 
-            let session = {
-                let guard = peer.session.lock().await;
-                guard.clone()
-            };
+        let mut tunnel_opened = false;
 
-            let session = match session {
-                Some(value) => value,
-                None => continue,
-            };
-
-            let action = match session.tunnel.encapsulate(packet) {
+        while let Some(resolver) = h3.accept().await? {
+            let (request, stream) = match resolver.resolve_request().await {
                 Ok(value) => value,
                 Err(err) => {
-                    tracing::debug!(?err, "encapsulate");
+                    tracing::debug!(?err, "некорректный запрос");
                     continue;
                 }
             };
 
-            if let TunnelAction::WriteToNetwork(data) = action {
-                let _ = session.out_tx.send(data).await;
+            let server = self.clone();
+
+            if !tunnel_opened && masque::is_connect_udp(&request) && masque::has_valid_token(&request, &self.token) {
+                tunnel_opened = true;
+                let connection = connection.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = server.serve_tunnel(connection, stream).await {
+                        tracing::warn!(error = format!("{err:#}"), "туннель завершился с ошибкой");
+                    }
+                });
+            } else {
+                tokio::spawn(async move {
+                    if let Err(err) = server.forward_to_fallback(request, stream).await {
+                        tracing::debug!(?err, "fallback");
+                    }
+                });
             }
         }
-    });
-}
 
-fn destination_ip(packet: &[u8]) -> Option<IpAddr> {
-    if packet.is_empty() {
-        return None;
+        Ok(())
     }
 
-    match packet[0] >> 4 {
-        4 if packet.len() >= 20 => {
-            let bytes = [packet[16], packet[17], packet[18], packet[19]];
-            Some(IpAddr::V4(Ipv4Addr::from(bytes)))
+    async fn serve_tunnel(&self, connection: quinn::Connection, mut stream: RequestStream) -> Result<()> {
+        let response = Response::builder().status(StatusCode::OK).header("capsule-protocol", "?1").body(())?;
+        stream.send_response(response).await?;
+
+        let channel = DatagramChannel::new(connection, stream.id().into_inner());
+        let required = mtu::wireguard_packet(self.mtu);
+        if channel.max_packet_size() < required {
+            tracing::warn!(limit = channel.max_packet_size(), required, "network.mtu на клиенте меньше, чем на сервере: крупные пакеты будут отброшены");
         }
-        6 if packet.len() >= 40 => {
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&packet[24..40]);
-            Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+
+        let (peer, handshake) = tokio::select! {
+            result = self.await_handshake(&channel) => result?,
+            result = watch_stream(&mut stream) => return result,
+        };
+
+        let tunnel = Tunnel::new(self.private_key.clone(), peer.public_key, peer.preshared_key, Some(self.keepalive), self.mtu);
+        let session = Arc::new(Session::new(tunnel, channel));
+        session.deliver(&handshake, &self.device).await?;
+
+        if peer.attach(session.clone()) {
+            tracing::info!(peer = %peer.name(), "вытеснение старой сессии");
+        }
+        tracing::info!(peer = %peer.name(), "peer подключился");
+
+        let result = tokio::select! {
+            result = session.receive(&self.device) => result,
+            result = session.run_timers() => result,
+            result = watch_stream(&mut stream) => result,
+        };
+
+        peer.detach(&session);
+        tracing::info!(peer = %peer.name(), "peer отключился");
+
+        let _ = stream.finish().await;
+        result
+    }
+
+    async fn await_handshake(&self, channel: &DatagramChannel) -> Result<(Arc<Peer>, Bytes)> {
+        loop {
+            let datagram = channel.recv().await?;
+            if let Some(peer) = identify(&self.peers, &self.private_key, &self.public_key, &datagram) {
+                return Ok((peer.clone(), datagram));
+            }
+        }
+    }
+
+    async fn dispatch_device(&self) -> Result<()> {
+        let mut buffer = vec![0; usize::from(self.mtu)];
+
+        loop {
+            let size = self.device.recv(&mut buffer).await.context("чтение из TUN")?;
+            let packet = &buffer[..size];
+
+            let Some(session) = destination(packet).and_then(|ip| find_peer(&self.peers, ip)).and_then(|peer| peer.session()) else {
+                continue;
+            };
+
+            if let Err(err) = session.send(packet) {
+                tracing::debug!(?err, "отправка peer'у");
+            }
+        }
+    }
+
+    async fn forward_to_fallback(&self, request: Request<()>, mut stream: RequestStream) -> Result<()> {
+        let Some(upstream) = self.upstream else {
+            return reject(&mut stream, StatusCode::NOT_FOUND).await;
+        };
+
+        let mut body = BytesMut::new();
+        while let Some(chunk) = stream.recv_data().await? {
+            body.put(chunk);
+        }
+
+        let response = match fallback::proxy_request(upstream, request, body.freeze()).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(?err, "fallback недоступен");
+                return reject(&mut stream, StatusCode::BAD_GATEWAY).await;
+            }
+        };
+
+        let (parts, body) = response.into_parts();
+        stream.send_response(Response::from_parts(parts, ())).await?;
+        if !body.is_empty() {
+            stream.send_data(body).await?;
+        }
+        stream.finish().await?;
+        Ok(())
+    }
+}
+
+fn identify<'a>(peers: &'a [Arc<Peer>], private_key: &StaticSecret, public_key: &PublicKey, datagram: &[u8]) -> Option<&'a Arc<Peer>> {
+    let Ok(Packet::HandshakeInit(init)) = Tunn::parse_incoming_packet(datagram) else {
+        return None;
+    };
+
+    let Ok(half) = parse_handshake_anon(private_key, public_key, &init) else {
+        tracing::warn!("некорректный handshake");
+        return None;
+    };
+
+    let peer = peers.iter().find(|peer| peer.public_key.as_bytes() == &half.peer_static_public);
+    if peer.is_none() {
+        tracing::warn!(key = %wg::encode_b64(&half.peer_static_public), "handshake от неизвестного peer'а");
+    }
+    peer
+}
+
+fn destination(packet: &[u8]) -> Option<IpAddr> {
+    match packet.first()? >> 4 {
+        4 => {
+            let octets: [u8; 4] = packet.get(16..20)?.try_into().ok()?;
+            Some(IpAddr::V4(Ipv4Addr::from(octets)))
+        }
+        6 => {
+            let octets: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
         }
         _ => None,
     }
 }
 
-fn find_peer_by_ip(peers: &[Arc<ServerPeer>], ip: IpAddr) -> Option<Arc<ServerPeer>> {
-    for peer in peers {
-        for subnet in &peer.allowed_ips {
-            if subnet.contains(&ip) {
-                return Some(peer.clone());
-            }
-        }
-    }
-    None
+fn find_peer(peers: &[Arc<Peer>], ip: IpAddr) -> Option<&Arc<Peer>> {
+    peers.iter().find(|peer| peer.allowed_ips.iter().any(|subnet| subnet.contains(&ip)))
 }
 
-async fn serve_h3(
-    conn: H3QuinnConnection,
-    config: Config,
-    peers: Arc<Vec<Arc<ServerPeer>>>,
-    private_key: StaticSecret,
-    device: Arc<AsyncDevice>,
-) -> Result<()> {
-    let mut h3 = h3::server::builder().build(conn).await?;
-
-    let datagram_inbound: Arc<Mutex<Option<mpsc::Sender<Bytes>>>> = Arc::new(Mutex::new(None));
-
-    {
-        let inbound = datagram_inbound.clone();
-        let mut reader = h3.get_datagram_reader();
-
-        tokio::spawn(async move {
-            loop {
-                let datagram = match reader.read_datagram().await {
-                    Ok(value) => value,
-                    Err(_) => return,
-                };
-
-                let payload = match masque::decode_datagram(datagram.into_payload()) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-
-                let tx = {
-                    let guard = inbound.lock().await;
-                    guard.clone()
-                };
-
-                if let Some(tx) = tx
-                    && tx.send(payload).await.is_err()
-                {
-                    tracing::debug!("inbound канал закрыт");
-                }
-            }
-        });
-    }
-
-    while let Some(resolver) = h3.accept().await? {
-        let config = config.clone();
-        let peers = peers.clone();
-        let private_key = private_key.clone();
-        let inbound = datagram_inbound.clone();
-        let device = device.clone();
-
-        let (request, stream) = match resolver.resolve_request().await {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        let sender = h3.get_datagram_sender(stream.id());
-
-        tokio::spawn(async move {
-            if let Err(err) = handle_request(request, stream, sender, config, peers, private_key, inbound, device).await {
-                tracing::warn!(?err, "ошибка запроса");
-            }
-        });
-    }
-
+async fn watch_stream(stream: &mut RequestStream) -> Result<()> {
+    while stream.recv_data().await?.is_some() {}
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_request<S, H>(
-    request: http::Request<()>,
-    mut stream: h3::server::RequestStream<S, Bytes>,
-    mut sender: h3_datagram::datagram_handler::DatagramSender<H, Bytes>,
-    config: Config,
-    peers: Arc<Vec<Arc<ServerPeer>>>,
-    private_key: StaticSecret,
-    inbound: Arc<Mutex<Option<mpsc::Sender<Bytes>>>>,
-    device: Arc<AsyncDevice>,
-) -> Result<()>
-where
-    S: h3::quic::BidiStream<Bytes> + Send + 'static,
-    H: h3_datagram::quic_traits::SendDatagram<Bytes> + Send + 'static,
-{
-    let is_connect_udp = masque::is_connect_udp(&request);
-    let token_ok = masque::has_valid_token(&request, &config.token);
-    let is_tunnel = is_connect_udp && token_ok;
-
-    if !is_tunnel {
-        return forward_to_fallback(request, stream, config).await;
-    }
-
-    let response = Response::builder().status(StatusCode::OK).header("capsule-protocol", "?1").body(())?;
-    stream.send_response(response).await?;
-
-    let (incoming_tx, mut incoming_rx) = mpsc::channel::<Bytes>(1024);
-    {
-        let mut guard = inbound.lock().await;
-        *guard = Some(incoming_tx);
-    }
-
-    let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(1024);
-
-    let outbound = tokio::spawn(async move {
-        while let Some(data) = out_rx.recv().await {
-            let datagram = masque::encode_datagram(&data);
-            if let Err(err) = sender.send_datagram(datagram) {
-                let dbg = format!("{err:?}");
-                if dbg.contains("TooLarge") {
-                    tracing::debug!(size = data.len(), "datagram TooLarge — дроп");
-                    continue;
-                }
-                tracing::warn!(?err, "send_datagram, останавливаем outbound");
-                return;
-            }
-        }
-    });
-
-    let first_packet = match incoming_rx.recv().await {
-        Some(value) => value,
-        None => {
-            outbound.abort();
-            return Ok(());
-        }
-    };
-
-    let (peer, tunnel, initial_actions) = match identify_peer(&peers, &private_key, &config, &first_packet) {
-        Some(value) => value,
-        None => {
-            tracing::warn!("handshake от неизвестного peer'а");
-            outbound.abort();
-            return Ok(());
-        }
-    };
-
-    let key_short = short_key(&peer.public_key);
-    tracing::info!(peer = %key_short, "peer подключился");
-
-    let session = Arc::new(PeerSession { tunnel: tunnel.clone(), out_tx: out_tx.clone() });
-
-    {
-        let mut guard = peer.session.lock().await;
-        if guard.is_some() {
-            tracing::info!(peer = %key_short, "вытеснение старой сессии");
-        }
-        *guard = Some(session.clone());
-    }
-
-    for action in initial_actions {
-        match action {
-            TunnelAction::WriteToNetwork(data) => {
-                let _ = out_tx.send(data).await;
-            }
-            TunnelAction::WriteToTun(data) => {
-                let _ = device.send(&data).await;
-            }
-            TunnelAction::None => {}
-        }
-    }
-
-    let from_quic = {
-        let tunnel = tunnel.clone();
-        let device = device.clone();
-        let out_tx = out_tx.clone();
-
-        tokio::spawn(async move {
-            while let Some(packet) = incoming_rx.recv().await {
-                let actions = match tunnel.decapsulate(&packet) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::debug!(?err, "decapsulate");
-                        continue;
-                    }
-                };
-
-                for action in actions {
-                    match action {
-                        TunnelAction::WriteToTun(data) => {
-                            if device.send(&data).await.is_err() {
-                                return;
-                            }
-                        }
-                        TunnelAction::WriteToNetwork(data) => {
-                            if out_tx.send(data).await.is_err() {
-                                return;
-                            }
-                        }
-                        TunnelAction::None => {}
-                    }
-                }
-            }
-        })
-    };
-
-    let timers = {
-        let tunnel = tunnel.clone();
-        let out_tx = out_tx.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-
-                let action = match tunnel.update_timers() {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::error!(?err, "timers");
-                        return;
-                    }
-                };
-
-                if let TunnelAction::WriteToNetwork(data) = action
-                    && out_tx.send(data).await.is_err()
-                {
-                    return;
-                }
-            }
-        })
-    };
-
-    drop(out_tx);
-
-    let result = loop {
-        match stream.recv_data().await {
-            Ok(Some(_)) => continue,
-            Ok(None) => break Ok(()),
-            Err(err) => break Err(err.into()),
-        }
-    };
-
-    tracing::info!(peer = %key_short, "peer отключился");
-
-    {
-        let mut guard = peer.session.lock().await;
-        *guard = None;
-    }
-    {
-        let mut guard = inbound.lock().await;
-        *guard = None;
-    }
-
-    from_quic.abort();
-    timers.abort();
-    outbound.abort();
-
-    let _ = stream.finish().await;
-    result
-}
-
-fn identify_peer(
-    peers: &[Arc<ServerPeer>],
-    private_key: &StaticSecret,
-    config: &Config,
-    packet: &[u8],
-) -> Option<(Arc<ServerPeer>, Arc<Tunnel>, Vec<TunnelAction>)> {
-    if crate::wg::is_handshake_init(packet) && !crate::wg::verify_mac1(packet, private_key) {
-        return None;
-    }
-
-    for peer in peers {
-        let tunnel = match Tunnel::new(private_key.clone(), peer.public_key, peer.preshared_key, Some(config.wireguard.persistent_keepalive)) {
-            Ok(value) => Arc::new(value),
-            Err(_) => continue,
-        };
-
-        let actions = match tunnel.decapsulate(packet) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        if !actions.is_empty() {
-            return Some((peer.clone(), tunnel, actions));
-        }
-    }
-
-    None
-}
-
-fn short_key(key: &PublicKey) -> String {
-    let encoded = crate::wg::encode_b64(key.as_bytes());
-    encoded.chars().take(8).collect()
-}
-
-async fn forward_to_fallback<S>(request: http::Request<()>, mut stream: h3::server::RequestStream<S, Bytes>, config: Config) -> Result<()>
-where
-    S: h3::quic::BidiStream<Bytes> + Send + 'static,
-{
-    let Some(fallback_config) = config.fallback else {
-        reject(&mut stream, StatusCode::NOT_FOUND).await?;
-        return Ok(());
-    };
-
-    let mut body = bytes::BytesMut::new();
-
-    while let Some(mut chunk) = stream.recv_data().await? {
-        while chunk.has_remaining() {
-            let part = chunk.chunk().to_vec();
-            let len = part.len();
-            body.extend_from_slice(&part);
-            chunk.advance(len);
-        }
-    }
-
-    let response = match fallback::proxy_request(fallback_config.upstream, request, body.freeze()).await {
-        Ok(value) => value,
-        Err(_) => {
-            reject(&mut stream, StatusCode::BAD_GATEWAY).await?;
-            return Ok(());
-        }
-    };
-
-    let (parts, body) = response.into_parts();
-    let head = http::Response::from_parts(parts, ());
-
-    stream.send_response(head).await?;
-
-    if !body.is_empty() {
-        stream.send_data(body).await?;
-    }
-
+async fn reject(stream: &mut RequestStream, status: StatusCode) -> Result<()> {
+    stream.send_response(Response::builder().status(status).body(())?).await?;
     stream.finish().await?;
     Ok(())
 }
 
-async fn reject<S>(stream: &mut h3::server::RequestStream<S, Bytes>, status: StatusCode) -> Result<()>
-where
-    S: h3::quic::BidiStream<Bytes> + Send + 'static,
-{
-    let response = Response::builder().status(status).body(())?;
-    stream.send_response(response).await?;
-    stream.finish().await?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_core::OsRng;
+
+    fn peer(public_key: PublicKey, allowed_ips: &[&str]) -> Arc<Peer> {
+        Arc::new(Peer { public_key, preshared_key: None, allowed_ips: allowed_ips.iter().map(|net| net.parse().unwrap()).collect(), session: Mutex::new(None) })
+    }
+
+    #[test]
+    fn destination_parses_ipv4_and_ipv6() {
+        let mut v4 = [0u8; 20];
+        v4[0] = 0x45;
+        v4[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        assert_eq!(destination(&v4), Some("10.0.0.2".parse().unwrap()));
+
+        let mut v6 = [0u8; 40];
+        v6[0] = 0x60;
+        v6[24..40].copy_from_slice(&"fd00::2".parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(destination(&v6), Some("fd00::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_rejects_truncated_and_unknown() {
+        assert_eq!(destination(&[]), None);
+        assert_eq!(destination(&[0x45; 19]), None);
+        assert_eq!(destination(&[0x60; 39]), None);
+        assert_eq!(destination(&[0x00; 40]), None);
+    }
+
+    #[test]
+    fn find_peer_by_allowed_ips() {
+        let first = StaticSecret::random_from_rng(OsRng);
+        let second = StaticSecret::random_from_rng(OsRng);
+        let peers = vec![peer(PublicKey::from(&first), &["10.0.0.2/32"]), peer(PublicKey::from(&second), &["10.0.1.0/24"])];
+
+        assert!(Arc::ptr_eq(find_peer(&peers, "10.0.0.2".parse().unwrap()).unwrap(), &peers[0]));
+        assert!(Arc::ptr_eq(find_peer(&peers, "10.0.1.77".parse().unwrap()).unwrap(), &peers[1]));
+        assert!(find_peer(&peers, "10.0.0.3".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn identify_peer_by_handshake() {
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = PublicKey::from(&server_secret);
+
+        let known_secret = StaticSecret::random_from_rng(OsRng);
+        let other_secret = StaticSecret::random_from_rng(OsRng);
+        let peers = vec![peer(PublicKey::from(&other_secret), &["10.0.0.3/32"]), peer(PublicKey::from(&known_secret), &["10.0.0.2/32"])];
+
+        let client = Tunnel::new(known_secret, server_public, None, None, mtu::DEFAULT_MTU);
+        let handshake = client.initiate_handshake().unwrap().unwrap();
+
+        let found = identify(&peers, &server_secret, &server_public, &handshake).unwrap();
+        assert!(Arc::ptr_eq(found, &peers[1]));
+    }
+
+    #[test]
+    fn identify_rejects_unknown_peer_and_garbage() {
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = PublicKey::from(&server_secret);
+        let peers = vec![peer(PublicKey::from(&StaticSecret::random_from_rng(OsRng)), &["10.0.0.2/32"])];
+
+        let stranger = Tunnel::new(StaticSecret::random_from_rng(OsRng), server_public, None, None, mtu::DEFAULT_MTU);
+        let handshake = stranger.initiate_handshake().unwrap().unwrap();
+
+        assert!(identify(&peers, &server_secret, &server_public, &handshake).is_none());
+        assert!(identify(&peers, &server_secret, &server_public, &[1, 2, 3]).is_none());
+    }
 }

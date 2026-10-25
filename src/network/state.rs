@@ -3,48 +3,64 @@ use ipnet::IpNet;
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
-const STATE_DIR: &str = "/var/run/wgh3";
+pub const STATE_DIR: &str = "/var/run/wgh3";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    pub fn of(net: &IpNet) -> Self {
+        match net {
+            IpNet::V4(_) => Family::V4,
+            IpNet::V6(_) => Family::V6,
+        }
+    }
+
+    pub fn flag(self) -> &'static str {
+        match self {
+            Family::V4 => "-4",
+            Family::V6 => "-6",
+        }
+    }
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct State {
     pub tun_name: String,
-    pub table: Option<u32>,
-    pub fwmark: Option<u32>,
-    pub default_v4_added: bool,
-    pub default_v6_added: bool,
-    pub rule_v4_added: bool,
-    pub rule_v6_added: bool,
-    #[serde(default)]
+    pub subnet_table: Option<u32>,
     pub subnet_routes: Vec<IpNet>,
+    pub table: u32,
+    pub fwmark: u32,
+    pub default_routes: Vec<Family>,
+    pub rules: Vec<Family>,
+    pub dns_managed: bool,
     pub pre_down: Vec<String>,
     pub post_down: Vec<String>,
-    pub dns_managed: bool,
 }
 
 impl State {
-    pub fn path(tun_name: &str) -> PathBuf {
-        Path::new(STATE_DIR).join(format!("{tun_name}.state"))
+    fn path(tun_name: &str) -> PathBuf {
+        PathBuf::from(STATE_DIR).join(format!("{tun_name}.state"))
     }
 
     pub fn save(&self) -> Result<()> {
         fs::create_dir_all(STATE_DIR)?;
-        let path = Self::path(&self.tun_name);
-        let data = serde_json::to_string_pretty(self)?;
-        fs::write(path, data)?;
+        fs::write(Self::path(&self.tun_name), serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
 
     pub fn load(tun_name: &str) -> Result<Option<Self>> {
-        let path = Self::path(tun_name);
-        if !path.exists() {
-            return Ok(None);
+        match fs::read_to_string(Self::path(tun_name)) {
+            Ok(data) => Ok(Some(serde_json::from_str(&data)?)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
         }
-        let data = fs::read_to_string(path)?;
-        let state = serde_json::from_str(&data)?;
-        Ok(Some(state))
     }
 
     pub fn remove(tun_name: &str) {

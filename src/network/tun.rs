@@ -1,32 +1,24 @@
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use ipnet::IpNet;
-use std::sync::Arc;
 use tun_rs::AsyncDevice;
 use tun_rs::DeviceBuilder;
 
-pub const MAX_PACKET_SIZE: usize = 65535;
+pub fn create(name: &str, address: IpNet, mtu: u16) -> Result<AsyncDevice> {
+    let builder = DeviceBuilder::new().name(name).mtu(mtu);
 
-pub struct Tun {
-    device: Arc<AsyncDevice>,
-    name: String,
-}
+    let builder = match address {
+        IpNet::V4(net) => builder.ipv4(net.addr(), net.prefix_len(), None),
+        IpNet::V6(net) => builder.ipv6(net.addr(), net.prefix_len()),
+    };
 
-impl Tun {
-    pub fn new(name: &str, address: IpNet, mtu: u16) -> Result<Self> {
-        let prefix = address.prefix_len();
-        let addr = address.addr();
+    let device = builder.build_async().context("не удалось создать TUN-интерфейс")?;
 
-        let device = DeviceBuilder::new().name(name).mtu(mtu as _).ipv4(addr, prefix, None).build_async().context("не удалось создать TUN-интерфейс")?;
-
-        Ok(Self { device: Arc::new(device), name: name.to_string() })
+    let actual = device.mtu().context("не удалось прочитать MTU TUN-интерфейса")?;
+    if actual != mtu {
+        bail!("MTU TUN-интерфейса {actual}, ожидалось {mtu}");
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn handle(&self) -> Arc<AsyncDevice> {
-        self.device.clone()
-    }
+    Ok(device)
 }

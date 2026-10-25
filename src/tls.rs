@@ -1,15 +1,13 @@
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::anyhow;
-use quinn::ClientConfig;
-use quinn::ServerConfig;
-use quinn::TransportConfig;
+use anyhow::bail;
 use rustls::DigitallySignedStruct;
 use rustls::RootCertStore;
 use rustls::SignatureScheme;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::client::danger::ServerCertVerified;
 use rustls::client::danger::ServerCertVerifier;
+use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
@@ -19,110 +17,77 @@ use sha2::Sha256;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::time::Duration;
 
-pub fn server_config(cert_path: &str, key_path: &str) -> Result<ServerConfig> {
+pub const ALPN_H3: &[&[u8]] = &[b"h3"];
+pub const ALPN_HTTPS: &[&[u8]] = &[b"h2", b"http/1.1"];
+
+pub fn server_config(cert_path: &str, key_path: &str, alpn: &[&[u8]]) -> Result<rustls::ServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
 
-    let mut tls = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
-    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config()?));
+    let mut config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
     Ok(config)
 }
 
-pub fn client_config(pin_sha256: Option<&str>, insecure: bool) -> Result<ClientConfig> {
+pub fn client_config(pin_sha256: Option<&str>, insecure: bool) -> Result<rustls::ClientConfig> {
     let builder = rustls::ClientConfig::builder();
 
-    let mut tls = match (pin_sha256, insecure) {
-        (Some(pin), _) => {
-            let verifier = CustomVerifier { mode: VerifyMode::Pinned(parse_fingerprint(pin)?) };
+    let policy = match (pin_sha256, insecure) {
+        (Some(pin), _) => Some(Policy::Pinned(parse_fingerprint(pin)?)),
+        (None, true) => Some(Policy::AnyCertificate),
+        (None, false) => None,
+    };
+
+    let mut config = match policy {
+        Some(policy) => {
+            let algorithms = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+            let verifier = Verifier { policy, algorithms };
             builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth()
         }
-        (None, true) => {
-            let verifier = CustomVerifier { mode: VerifyMode::Insecure };
-            builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth()
-        }
-        (None, false) => {
-            let mut roots = RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        None => {
+            let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
             builder.with_root_certificates(roots).with_no_client_auth()
         }
     };
 
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
-    let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config()?));
+    config.alpn_protocols = ALPN_H3.iter().map(|protocol| protocol.to_vec()).collect();
     Ok(config)
 }
 
-pub fn rustls_server_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::ServerConfig>> {
-    let certs = load_certs(cert_path)?;
-    let key = load_key(key_path)?;
-
-    let mut tls = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
-    tls.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
-
-    Ok(Arc::new(tls))
-}
-
-fn transport_config() -> Result<TransportConfig> {
-    let mut transport = TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));
-    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    transport.datagram_send_buffer_size(8 * 1024 * 1024);
-    transport.stream_receive_window((4u32 * 1024 * 1024).into());
-    transport.receive_window((16u32 * 1024 * 1024).into());
-    transport.send_window(16 * 1024 * 1024);
-    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-    Ok(transport)
-}
-
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).context("не удалось открыть сертификат")?;
-    let mut reader = BufReader::new(file);
-
-    rustls_pemfile::certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>().context("не удалось прочитать сертификаты")
+    let file = File::open(path).with_context(|| format!("не удалось открыть сертификат {path}"))?;
+    rustls_pemfile::certs(&mut BufReader::new(file)).collect::<std::result::Result<_, _>>().context("не удалось прочитать сертификаты")
 }
 
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path).context("не удалось открыть ключ")?;
-    let mut reader = BufReader::new(file);
-
-    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| anyhow!("приватный ключ не найден"))
+    let file = File::open(path).with_context(|| format!("не удалось открыть ключ {path}"))?;
+    rustls_pemfile::private_key(&mut BufReader::new(file))?.context("приватный ключ не найден")
 }
 
 fn parse_fingerprint(value: &str) -> Result<[u8; 32]> {
-    let cleaned: String = value.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
-    let bytes = hex::decode(&cleaned).context("некорректный hex в pin_sha256")?;
+    let digits: String = value.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+    let bytes = hex::decode(&digits).context("некорректный hex в pin_sha256")?;
 
-    if bytes.len() != 32 {
-        return Err(anyhow!("pin_sha256 должен быть 32 байта"));
+    match bytes.try_into() {
+        Ok(fingerprint) => Ok(fingerprint),
+        Err(_) => bail!("pin_sha256 должен быть 32 байта"),
     }
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
 }
 
 #[derive(Debug)]
-enum VerifyMode {
+enum Policy {
     Pinned([u8; 32]),
-    Insecure,
+    AnyCertificate,
 }
 
 #[derive(Debug)]
-struct CustomVerifier {
-    mode: VerifyMode,
+struct Verifier {
+    policy: Policy,
+    algorithms: WebPkiSupportedAlgorithms,
 }
 
-impl ServerCertVerifier for CustomVerifier {
+impl ServerCertVerifier for Verifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -131,12 +96,11 @@ impl ServerCertVerifier for CustomVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        match &self.mode {
-            VerifyMode::Insecure => Ok(ServerCertVerified::assertion()),
-            VerifyMode::Pinned(fingerprint) => {
+        match &self.policy {
+            Policy::AnyCertificate => Ok(ServerCertVerified::assertion()),
+            Policy::Pinned(expected) => {
                 let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-
-                if actual == *fingerprint {
+                if actual == *expected {
                     Ok(ServerCertVerified::assertion())
                 } else {
                     Err(rustls::Error::General("отпечаток сертификата не совпадает".into()))
@@ -147,34 +111,44 @@ impl ServerCertVerifier for CustomVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-        ]
+        self.algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_accepts_colons_and_spaces() {
+        let plain = "ab".repeat(32);
+        let with_colons = vec!["AB"; 32].join(":");
+
+        assert_eq!(parse_fingerprint(&plain).unwrap(), [0xab; 32]);
+        assert_eq!(parse_fingerprint(&with_colons).unwrap(), [0xab; 32]);
+        assert_eq!(parse_fingerprint(&format!(" {plain} ")).unwrap(), [0xab; 32]);
+    }
+
+    #[test]
+    fn fingerprint_rejects_wrong_length_and_garbage() {
+        assert!(parse_fingerprint(&"ab".repeat(31)).is_err());
+        assert!(parse_fingerprint("zz").is_err());
     }
 }

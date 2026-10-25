@@ -8,7 +8,7 @@ private_key = "<private.key>"
 [network]
 tun_name = "wgh3"
 address = "10.0.0.1/24"
-mtu = 1380
+mtu = 1380  # MTU TUN; на сервере не меньше, чем на клиенте. IP-пакет: mtu + 100 (IPv4) / mtu + 120 (IPv6)
 
 # Хуки в стиле wg-quick. %i подставляется именем TUN.
 # Например, включить форвардинг и настроить NAT при старте,
