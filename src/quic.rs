@@ -8,6 +8,7 @@ use quinn::ServerConfig;
 use quinn::TransportConfig;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::crypto::rustls::QuicServerConfig;
+use std::io;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
@@ -23,14 +24,12 @@ pub fn server_endpoint(listen: SocketAddr, tls: rustls::ServerConfig, mtu: u16) 
     endpoint(socket, Some(config), mtu)
 }
 
-pub fn client_endpoint(server: SocketAddr, tls: rustls::ClientConfig, mtu: u16, fwmark: Option<u32>) -> Result<Endpoint> {
+pub fn client_socket(server: SocketAddr) -> io::Result<UdpSocket> {
     let bind = if server.is_ipv4() { SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)) } else { SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)) };
-    let socket = UdpSocket::bind(bind)?;
+    UdpSocket::bind(bind)
+}
 
-    if let Some(mark) = fwmark {
-        set_mark(&socket, mark)?;
-    }
-
+pub fn client_endpoint(socket: UdpSocket, tls: rustls::ClientConfig, mtu: u16) -> Result<Endpoint> {
     let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     config.transport_config(Arc::new(transport_config(mtu)?));
 
@@ -64,20 +63,4 @@ fn transport_config(mtu: u16) -> Result<TransportConfig> {
     transport.send_window(16 * 1024 * 1024);
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     Ok(transport)
-}
-
-fn set_mark(socket: &UdpSocket, mark: u32) -> Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let value = mark as libc::c_int;
-    let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-
-    // SAFETY: fd принадлежит живому сокету, указатель и размер описывают локальный c_int.
-    let result = unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK, (&value as *const libc::c_int).cast(), size) };
-
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("setsockopt(SO_MARK)");
-    }
-
-    Ok(())
 }

@@ -33,6 +33,7 @@ jobs:
       - name: install build deps
         run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --lib --no-default-features -- -D warnings
 
   test:
     name: test
@@ -44,6 +45,7 @@ jobs:
       - name: install build deps
         run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo test --all-targets
+      - run: cargo test --lib --no-default-features
 
   build:
     name: build

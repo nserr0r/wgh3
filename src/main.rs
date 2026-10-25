@@ -4,9 +4,9 @@ use anyhow::anyhow;
 use rand_core::OsRng;
 use rand_core::RngCore;
 use tracing_subscriber::EnvFilter;
-use wgh3::client;
 use wgh3::config::Config;
 use wgh3::config::Mode;
+use wgh3::linux;
 use wgh3::network::lifecycle;
 use wgh3::network::state::State;
 use wgh3::server;
@@ -47,7 +47,7 @@ async fn run(path: &str) -> Result<()> {
     let config = Config::load(path)?;
     match config.mode {
         Mode::Server => server::run(config).await,
-        Mode::Client => client::run(config).await,
+        Mode::Client => linux::run_client(config).await,
     }
 }
 

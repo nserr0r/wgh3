@@ -1,13 +1,21 @@
 pub mod client;
 pub mod config;
-pub mod decoy;
-pub mod fallback;
 pub mod masque;
 pub mod mtu;
-pub mod network;
 pub mod quic;
-pub mod server;
 pub mod session;
-pub mod signal;
 pub mod tls;
 pub mod wg;
+
+#[cfg(feature = "daemon")]
+pub mod decoy;
+#[cfg(feature = "daemon")]
+pub mod fallback;
+#[cfg(feature = "daemon")]
+pub mod linux;
+#[cfg(feature = "daemon")]
+pub mod network;
+#[cfg(feature = "daemon")]
+pub mod server;
+#[cfg(feature = "daemon")]
+pub mod signal;

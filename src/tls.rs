@@ -9,18 +9,17 @@ use rustls::client::danger::ServerCertVerified;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::CertificateDer;
-use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
 use sha2::Digest;
 use sha2::Sha256;
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
 pub const ALPN_H3: &[&[u8]] = &[b"h3"];
+#[cfg(feature = "daemon")]
 pub const ALPN_HTTPS: &[&[u8]] = &[b"h2", b"http/1.1"];
 
+#[cfg(feature = "daemon")]
 pub fn server_config(cert_path: &str, key_path: &str, alpn: &[&[u8]]) -> Result<rustls::ServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
@@ -55,14 +54,16 @@ pub fn client_config(pin_sha256: Option<&str>, insecure: bool) -> Result<rustls:
     Ok(config)
 }
 
+#[cfg(feature = "daemon")]
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).with_context(|| format!("не удалось открыть сертификат {path}"))?;
-    rustls_pemfile::certs(&mut BufReader::new(file)).collect::<std::result::Result<_, _>>().context("не удалось прочитать сертификаты")
+    let file = std::fs::File::open(path).with_context(|| format!("не удалось открыть сертификат {path}"))?;
+    rustls_pemfile::certs(&mut std::io::BufReader::new(file)).collect::<std::result::Result<_, _>>().context("не удалось прочитать сертификаты")
 }
 
-fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path).with_context(|| format!("не удалось открыть ключ {path}"))?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))?.context("приватный ключ не найден")
+#[cfg(feature = "daemon")]
+fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path).with_context(|| format!("не удалось открыть ключ {path}"))?;
+    rustls_pemfile::private_key(&mut std::io::BufReader::new(file))?.context("приватный ключ не найден")
 }
 
 fn parse_fingerprint(value: &str) -> Result<[u8; 32]> {

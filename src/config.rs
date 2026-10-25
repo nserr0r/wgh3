@@ -153,7 +153,7 @@ impl Config {
         Self::parse(&data)
     }
 
-    fn parse(data: &str) -> Result<Self> {
+    pub fn parse(data: &str) -> Result<Self> {
         let config: Self = toml::from_str(data).context("не удалось разобрать конфиг")?;
         config.validate()?;
         Ok(config)

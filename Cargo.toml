@@ -3,6 +3,26 @@ name = "wgh3"
 version = "0.4.0"
 edition = "2024"
 
+[features]
+default = ["daemon"]
+daemon = [
+  "dep:http-body-util",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:libc",
+  "dep:rustls-pemfile",
+  "dep:serde_json",
+  "dep:tokio-rustls",
+  "dep:tracing-subscriber",
+  "quinn/bloom",
+  "tokio/full",
+]
+
+[[bin]]
+name = "wgh3"
+path = "src/main.rs"
+required-features = ["daemon"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.13"
@@ -12,26 +32,27 @@ h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt
 h3-quinn = "0.0.10"
 hex = "0.4"
 http = "1.4"
-http-body-util = "0.1"
-hyper = { version = "1.9", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 ipnet = { version = "2.12", features = ["serde"] }
-libc = "0.2"
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
-rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 sha2 = "0.11"
-tokio = { version = "1.52", features = ["full"] }
-tokio-rustls = "0.26"
+tokio = { version = "1.52", features = ["macros", "net", "rt", "sync", "time"] }
 toml = "1.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tun-rs = { version = "2.8", features = ["async"] }
 webpki-roots = "1.0"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1.9", features = ["client", "http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"], optional = true }
+libc = { version = "0.2", optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+serde_json = { version = "1.0", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [profile.release]
 opt-level = 3

@@ -333,6 +333,16 @@ sudo wgh3 cleanup wgh3
 
 Где `wgh3` — имя TUN-интерфейса. systemd-юнит делает это автоматически через `ExecStopPost`.
 
+## Использование как библиотеки
+
+Клиентское ядро доступно как крейт без серверной и Linux-части (feature `daemon` включена по умолчанию и нужна только бинарю `wgh3`):
+
+```toml
+wgh3 = { git = "https://github.com/nserr0r/wgh3", default-features = false }
+```
+
+Встраивание — через трейт `wgh3::client::Platform`: `protect` вызывается для каждого нового UDP-сокета (на Android — `VpnService.protect`), `connected` / `disconnected` сообщают о состоянии. `Client::run` принимает `tun_rs::AsyncDevice` (например, из fd через `AsyncDevice::from_fd`), а `Client::network_changed` переносит QUIC-соединение на новый сокет при смене сети без разрыва туннеля. Так устроен Android-клиент.
+
 ## Запуск
 
 ### Через systemd
